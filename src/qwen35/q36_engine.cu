@@ -16,6 +16,7 @@
 //
 // Modes: --serve (serve/server.py's engine protocol: READY / GEN / T / DONE / STOP / PP), --tokens IDS [--n N]
 // [--force IDS] [--dump-full-logits F] (tools/qwen35/kl.py's reference interface), --bench-pp N / --bench-tg N.
+#include "strata/artifact/dequant.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/family_layout.hpp"
 #include "strata/kernels/fused_gdn.hpp"
@@ -946,8 +947,19 @@ float* upload_f32(const strata::TensorInfo& t, const uint8_t* src) {
             const float d = f16_to_f32((uint16_t) (q[0] | (q[1] << 8)));
             for (int j = 0; j < 32; ++j) h[b * 32 + j] = d * (float) (int8_t) q[2 + j];
         }
+    } else if ((t.type == 11 || t.type == 12 || t.type == 13 || t.type == 14) && h.size() % 256 == 0) {
+        // Q3_K / Q4_K / Q5_K / Q6_K (some community files store ssm_alpha / ssm_beta so): 256-element super-blocks
+        const size_t bb = t.type == 11 ? 110 : t.type == 12 ? 144 : t.type == 13 ? 176 : 210;
+        for (size_t b = 0; b < h.size() / 256; ++b) {
+            const uint8_t* q = src + b * bb;
+            float* o = h.data() + b * 256;
+            if (t.type == 11) strata::dequantize_q3_K(q, o);
+            else if (t.type == 12) strata::dequantize_q4_K(q, o);
+            else if (t.type == 13) strata::dequantize_q5_K(q, o);
+            else strata::dequantize_q6_K(q, o);
+        }
     } else {
-        std::fprintf(stderr, "strata-q36: %s is %s, expected F32, BF16, F16 or Q8_0\n", t.name.c_str(), t.type_name());
+        std::fprintf(stderr, "strata-q36: %s is %s, expected F32, BF16, F16, Q8_0 or Q3_K-Q6_K\n", t.name.c_str(), t.type_name());
         std::exit(1);
     }
     float* d = nullptr;
@@ -3736,6 +3748,7 @@ int strata::qwen35::run(int argc, char** argv) {
     std::string model, tokens, force, dump_full, emb_file;
     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 128;
     double expert_vram = -1.0;
+    double vram_reserve_mib = -1.0;   // --vram-reserve: VRAM left free for other programs (< 0: the built-in 768 MiB)
     bool warm = true;
     int expert_slots = 0, batch = 0, draft_vocab = -1;
     bool serve_mode = false, graph = true, vision = false, batch_mtp = false;
@@ -3776,6 +3789,7 @@ int strata::qwen35::run(int argc, char** argv) {
         else if (a == "--batch" || a == "--slots") batch = std::atoi(next().c_str());   // sessions decoding together
         else if (a == "--batch-mtp") batch_mtp = true;                                  // ... each verifying an MTP proposal
         else if (a == "--expert-vram") expert_vram = std::atof(next().c_str());   // GiB for the routed experts
+        else if (a == "--vram-reserve") vram_reserve_mib = std::atof(next().c_str());   // MiB left free (other models)
         else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
         else if (a == "--expert-slots") expert_slots = std::atoi(next().c_str());
         else if (a == "--hybrid-rows") hybrid_rows = std::atoi(next().c_str());
@@ -3822,6 +3836,10 @@ int strata::qwen35::run(int argc, char** argv) {
         size_t fr = 0, tot = 0, experts = 0;
         CK(cudaMemGetInfo(&fr, &tot));
         for (const Layer& L : m.layers) experts += L.stride * (size_t) m.g.n_expert;
+        if (vram_reserve_mib >= 0 && expert_vram < 0) {   // the reserve is not the engine's to use
+            const size_t rs = (size_t) (vram_reserve_mib * 1048576.0);
+            fr = fr > rs ? fr - rs : 0;
+        }
         const size_t fr_raw = fr;   // before the packed Q8_0 copies count as given back
         // (the MTP block's experts can go to the CPU, the packed Q8_0 copies can be given back: see place_experts)
         size_t packed = 0;
@@ -3861,9 +3879,26 @@ int strata::qwen35::run(int argc, char** argv) {
                          fr / 1073741824.0, fr_raw / 1073741824.0, packed / 1073741824.0, experts / 1073741824.0, chunk);
     }
     E.init(m, ctx, chunk, batch, vision);
+    if (vram_reserve_mib >= 0 && expert_vram < 0) {
+        // --vram-reserve: the experts get the VRAM free after the engine's buffers less the reserve and less what the
+        // hybrid mode allocates beside its slots (the staging pair and the CPU part's outputs, about 0.5 GiB at most):
+        // an explicit --expert-vram budget from here on
+        size_t fr = 0, tot = 0;
+        CK(cudaMemGetInfo(&fr, &tot));
+        const double room = (double) fr - vram_reserve_mib * 1048576.0 - 512.0 * 1048576.0;
+        expert_vram = std::max(0.0, room / (double) (1ull << 30));
+        std::fprintf(stderr, "strata-q36: --vram-reserve %.0f MiB: %.2f GiB free after the engine's buffers, %.2f GiB for "
+                     "the routed experts\n", vram_reserve_mib, (double) fr / (1ull << 30), expert_vram);
+    }
     if (!place_experts(m, E, expert_vram, cpu_threads, hybrid_rows, expert_slots, err)) {
         std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
         return 1;
+    }
+    if (vram_reserve_mib >= 0) {
+        size_t fr = 0, tot = 0;
+        CK(cudaMemGetInfo(&fr, &tot));
+        std::fprintf(stderr, "strata-q36: %.0f MiB of VRAM free after the experts (--vram-reserve %.0f)\n",
+                     (double) fr / 1048576.0, vram_reserve_mib);
     }
     struct Report {
         Engine& E;
